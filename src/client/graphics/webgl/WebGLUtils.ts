@@ -1,6 +1,6 @@
 export class WebGLUtils {
   static createShader(
-    gl: WebGLRenderingContext,
+    gl: WebGLRenderingContextBase,
     type: number,
     source: string,
   ): WebGLShader | null {
@@ -24,7 +24,7 @@ export class WebGLUtils {
   }
 
   static createProgram(
-    gl: WebGLRenderingContext,
+    gl: WebGLRenderingContextBase,
     vertexShader: WebGLShader,
     fragmentShader: WebGLShader,
   ): WebGLProgram | null {
@@ -52,10 +52,13 @@ export class WebGLUtils {
    * Creates a WebGL texture from RGBA data
    */
   static createTexture(
-    gl: WebGLRenderingContext,
+    gl: WebGLRenderingContext | WebGL2RenderingContext,
     width: number,
     height: number,
-    data: Uint8Array,
+    data: Uint8Array | Uint16Array,
+    internalFormat: GLenum = gl.RGBA,
+    format: GLenum = gl.RGBA,
+    type: GLenum = gl.UNSIGNED_BYTE,
   ): WebGLTexture | null {
     const texture = gl.createTexture();
     if (!texture) {
@@ -69,12 +72,12 @@ export class WebGLUtils {
     gl.texImage2D(
       gl.TEXTURE_2D,
       0,
-      gl.RGBA,
+      internalFormat,
       width,
       height,
       0,
-      gl.RGBA,
-      gl.UNSIGNED_BYTE,
+      format,
+      type,
       data,
     );
 
@@ -90,11 +93,28 @@ export class WebGLUtils {
   static isWebGLSupported(): boolean {
     try {
       const canvas = document.createElement("canvas");
-      const gl =
-        canvas.getContext("webgl") || canvas.getContext("experimental-webgl");
+      const gl = canvas.getContext("webgl2");
       return gl !== null;
     } catch (e) {
       return false;
     }
+  }
+
+  /**
+   * Gets uniform information by name from the shader program
+   */
+  static getUniformInfoByName(
+    gl: WebGLRenderingContext | WebGL2RenderingContext,
+    program: WebGLProgram,
+    uniformName: string,
+  ): WebGLActiveInfo | null {
+    const numUniforms = gl.getProgramParameter(program, gl.ACTIVE_UNIFORMS);
+    for (let i = 0; i < numUniforms; i++) {
+      const info = gl.getActiveUniform(program, i);
+      if (info && info.name === uniformName) {
+        return info;
+      }
+    }
+    return null;
   }
 }

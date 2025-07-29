@@ -626,6 +626,9 @@ export class GameView implements GameMap {
   ownerID(ref: TileRef): number {
     return this._map.ownerID(ref);
   }
+  ownerBuffer(): Uint16Array {
+    return (this._map as any).ownerBuffer();
+  }
   hasOwner(ref: TileRef): boolean {
     return this._map.hasOwner(ref);
   }

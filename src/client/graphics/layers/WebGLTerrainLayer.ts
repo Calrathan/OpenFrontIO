@@ -7,7 +7,7 @@ import { TerrainLayer } from "./TerrainLayer";
 
 export class WebGLTerrainLayer implements Layer {
   private canvas: HTMLCanvasElement;
-  private gl: WebGLRenderingContext | null = null;
+  private gl: WebGL2RenderingContext | null = null;
   private program: WebGLProgram | null = null;
   private texture: WebGLTexture | null = null;
   private fallbackLayer: TerrainLayer | null = null;
@@ -132,11 +132,16 @@ export class WebGLTerrainLayer implements Layer {
     this.canvas.width = this.game.width();
     this.canvas.height = this.game.height();
 
-    this.gl = this.canvas.getContext("webgl") as WebGLRenderingContext | null;
+    this.gl = this.canvas.getContext("webgl2") as WebGL2RenderingContext | null;
     if (!this.gl) {
       console.error("Failed to get WebGL context");
       return false;
     }
+    console.log("WebGL Version:", this.gl.getParameter(this.gl.VERSION));
+    console.log(
+      "GLSL Version:",
+      this.gl.getParameter(this.gl.SHADING_LANGUAGE_VERSION),
+    );
 
     const vertexShader = WebGLUtils.createShader(
       this.gl,

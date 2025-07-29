@@ -2,48 +2,54 @@ import { PriorityQueue } from "@datastructures-js/priority-queue";
 import { Colord } from "colord";
 import { Theme } from "../../../core/configuration/Config";
 import { EventBus } from "../../../core/EventBus";
-import { Cell, PlayerType, UnitType } from "../../../core/game/Game";
+import { PlayerType } from "../../../core/game/Game";
 import { euclDistFN, TileRef } from "../../../core/game/GameMap";
 import { GameUpdateType } from "../../../core/game/GameUpdates";
 import { GameView, PlayerView } from "../../../core/game/GameView";
 import { UserSettings } from "../../../core/game/UserSettings";
-import { PseudoRandom } from "../../../core/PseudoRandom";
-import {
-  AlternateViewEvent,
-  DragEvent,
-  RefreshGraphicsEvent,
-} from "../../InputHandler";
+import { AlternateViewEvent } from "../../InputHandler";
 import { TransformHandler } from "../TransformHandler";
+import { ColorPalette } from "../webgl/data/ColorPalette";
+import { TextureData } from "../webgl/TextureData";
+import { UniformSetter, UniformValue } from "../webgl/UniformSetter";
 import { WebGLUtils } from "../webgl/WebGLUtils";
 import { Layer } from "./Layer";
 
 export class WebGLTerritoryLayer implements Layer {
   private canvas: HTMLCanvasElement;
-  private gl: WebGLRenderingContext | null = null;
+  private gl: WebGL2RenderingContext | null = null;
   private program: WebGLProgram | null = null;
-  private texture: WebGLTexture | null = null;
-  private ownerTexture: WebGLTexture | null = null;
   private vertexBuffer: WebGLBuffer | null = null;
   private theme: Theme;
-  private textureUniformLocation: WebGLUniformLocation | null = null;
-  private ownerTextureUniformLocation: WebGLUniformLocation | null = null;
-  private textureSizeUniformLocation: WebGLUniformLocation | null = null;
-  private focusedBorderColorUniformLocation: WebGLUniformLocation | null = null;
-  private hasFocusedPlayerUniformLocation: WebGLUniformLocation | null = null;
-  private focusedPlayerIdUniformLocation: WebGLUniformLocation | null = null;
+
   private needsRedraw = false;
 
   private userSettings: UserSettings;
-  private textureData: Uint8Array | null = null;
-  private ownerTextureData: Uint8Array | null = null;
+  private paletteTextureData: TextureData | null = null;
+  private tileTextureData: TextureData | null = null;
+
+  //
+  // CPU copy of GPU data
+  //
+  private colorPalette: ColorPalette | null = null;
+
+  private uniforms: {
+    sampler: Record<string, number>;
+    ui: Record<string, UniformValue>;
+    debug: Record<string, UniformValue>;
+  } = { sampler: {}, ui: {}, debug: {} };
+
+  //
+  // GPU helpers
+  //
+  private uniformSetter: UniformSetter | null = null;
+
   private tileToRenderQueue: PriorityQueue<{
     tile: TileRef;
     lastUpdate: number;
   }> = new PriorityQueue((a, b) => {
     return a.lastUpdate - b.lastUpdate;
   });
-  private random = new PseudoRandom(123);
-  private cachedTerritoryPatternsEnabled: boolean | undefined;
 
   // Used for spawn highlighting
   private highlightCanvas: HTMLCanvasElement;
@@ -58,94 +64,262 @@ export class WebGLTerritoryLayer implements Layer {
 
   private lastFocusedPlayer: PlayerView | null = null;
 
-  private static readonly VERTEX_SHADER_SOURCE = `
-    attribute vec2 a_position;
-    attribute vec2 a_texCoord;
-    varying vec2 v_texCoord;
-    
-    void main() {
-      gl_Position = vec4(a_position, 0.0, 1.0);
-      v_texCoord = a_texCoord;
-    }
-  `;
+  private static readonly VERTEX_SHADER_SOURCE = `#version 300 es
+in vec2 a_position;
+in vec2 a_texCoord;
+out vec2 v_texCoord;
 
-  private static readonly FRAGMENT_SHADER_SOURCE = `
-    precision mediump float;
-    uniform sampler2D u_texture;
-    uniform sampler2D u_ownerTexture;
-    uniform vec2 u_textureSize;
-    uniform vec3 u_focusedBorderColor;
-    uniform float u_hasFocusedPlayer;
-    uniform int u_focusedPlayerId;
-    varying vec2 v_texCoord;
+void main() {
+  gl_Position = vec4(a_position, 0.0, 1.0);
+  v_texCoord = a_texCoord;
+}`;
+
+  private static readonly FRAGMENT_SHADER_SOURCE = `#version 300 es
+precision mediump float;
+precision mediump usampler2D;  // sampled integers are only 16 bits
+precision mediump int;
+
+// uv coordinates for map
+in vec2 v_texCoord;
+
+// Output
+out vec4 fragColor;
+
+// GPU territory tile data
+uniform usampler2D u_tileTexture;
+
+// UI state
+uniform float u_hasFocusedPlayer;
+uniform int u_focusedPlayerId;
+
+// Color data
+uniform sampler2D u_paletteTexture;
+uniform float u_territoryAlpha;     // Common alpha for all territory colors
+uniform float u_borderAlpha;        // Common alpha for borders
+uniform vec3 u_focusedBorderColor;
+uniform vec3 u_falloutColor;
+
+// Currently not used - uncomment in uniform declaration and here if needed
+//uniform vec3 u_spawnHighlightColor;
+//uniform vec3 u_selfColor;
+//uniform vec3 u_allyColor;
+//uniform vec3 u_enemyColor;
+
+uniform bool debug_draw_palette;
+uniform bool debug_draw_tiles;
+uniform float debug_draw_cpu_percent;
+
+//
+// common shader helper functions
+// 
+
+// Fetch unfiltered pixel at u,v
+vec4 fetchPixel(sampler2D texture, vec2 uv)
+{
+  int mipLevel = 0;
+  ivec2 textureDims = textureSize(texture, mipLevel);
+  ivec2 pixelCoord = ivec2(floor(uv * vec2(textureDims)));
+  return texelFetch(texture, pixelCoord, mipLevel);
+}
+
+//
+// Terrain shading implementation
+//
+
+const uint UNOWNED_TERRITORY_ID = 0u;
+const uint OWNER_ID_MASK = (1u << 12) - 1u; // all lower 12 bits
+const uint FALLOUT_MASK = 1u << 13;
+const uint DEFENSE_BONUS_MASK = 1u << 14;
+
+struct TileData {
+    uint ownerId;
+    bool isFallout;
+    bool hasDefenseBonus;
+};
+
+// Extract the territory bits into a struct (code cleanliness)
+TileData DecodeTileData(uint bits)
+{
+  TileData result;
+  result.ownerId         = (bits & OWNER_ID_MASK);
+  result.isFallout       = (bits & FALLOUT_MASK) != 0u;
+  result.hasDefenseBonus = (bits & DEFENSE_BONUS_MASK) != 0u;
+  return result;
+}
+
+// Fetch and Decode the tile data for the current fragment
+TileData ThisTile()
+{
+    uint bits = texture(u_tileTexture, v_texCoord).r;
+    return DecodeTileData(bits);
+}
+
+vec4 DebugDrawTileData(vec4 inColor)
+{
+  int debugTileSize = 4;
+  ivec2 textureDims = textureSize(u_tileTexture, 0);
+  ivec2 pixelCoord = ivec2(floor(v_texCoord * vec2(textureDims)));
+
+  int stipple = ((pixelCoord.y >> debugTileSize) ^ (pixelCoord.x >> debugTileSize)) & 1;
+
+  if (stipple == 0) 
+  {
+    TileData tileData = ThisTile();
+    vec4 debugColor = vec4(
+      float(tileData.ownerId)/255.0, 
+      tileData.isFallout ? 1.0f : 0.0f, 
+      tileData.hasDefenseBonus ? 1.0f : 0.0f, 1.0);
+    return mix(inColor, debugColor, 0.5);
+  }
+  
+  return inColor;
+}
+  
+// Check if a pixel is a border by comparing with neighbors
+bool isBorder(vec2 uv, uint ownerId) 
+{
+  int mipLevel = 0;
+  ivec2 textureDims = textureSize(u_tileTexture, mipLevel);
+  ivec2 texel_xy = ivec2(floor(uv * vec2(textureDims)));
+
+  uvec4 neighbors;
+  neighbors[0] = texelFetch(u_tileTexture, texel_xy + ivec2(-1, 0), mipLevel).r & OWNER_ID_MASK;
+  neighbors[1] = texelFetch(u_tileTexture, texel_xy + ivec2(+1, 0), mipLevel).r & OWNER_ID_MASK;
+  neighbors[2] = texelFetch(u_tileTexture, texel_xy + ivec2(0, -1), mipLevel).r & OWNER_ID_MASK;
+  neighbors[3] = texelFetch(u_tileTexture, texel_xy + ivec2(0, +1), mipLevel).r & OWNER_ID_MASK;
+
+  bvec4 matches;
+  matches[0] = (neighbors[0] == ownerId); 
+  matches[1] = (neighbors[1] == ownerId);
+  matches[2] = (neighbors[2] == ownerId);
+  matches[3] = (neighbors[3] == ownerId);
+
+  return !all(matches);
+}
+
+//
+// LUT for player specific colors
+//
+const uint PLAYER_COLOR_TERRITORY                  = 0u;
+const uint PLAYER_COLOR_TEAM                       = 1u;
+const uint PLAYER_COLOR_BORDER                     = 3u;
+const uint PLAYER_COLOR_DEFENSE_BONUS_BORDER_LIGHT = 4u;
+const uint PLAYER_COLOR_DEFENSE_BONUS_BORDER_DARK  = 5u;
+
+// Sample the player palette buffer
+vec4 getPlayerColor(uint ownerId, uint row)
+{
+  int mipLevel = 0;
+  ivec2 pixelCoord = ivec2(ownerId, row);
+  vec4 paletteColor = texelFetch(u_paletteTexture, pixelCoord, mipLevel);
+  float alpha = (row >= PLAYER_COLOR_BORDER) ? u_borderAlpha : u_territoryAlpha;
+  return vec4(paletteColor.rgb, alpha);
+}
+
+vec4 calculateDefendedBorderColor(uint ownerId, vec2 uv) 
+{ 
+    int mipmapLevel = 0;
+    ivec2 textureDimensions = textureSize(u_tileTexture, mipmapLevel);
+    ivec2 pixelCoord = ivec2(floor(uv * vec2(textureDimensions)));
+
+    int stipple = (pixelCoord.y ^ pixelCoord.x) & 1;
+    uint paletteRow = (stipple == 0) ? 
+        PLAYER_COLOR_DEFENSE_BONUS_BORDER_LIGHT :
+        PLAYER_COLOR_DEFENSE_BONUS_BORDER_DARK;
+
+  return getPlayerColor(ownerId, paletteRow); 
+}
+
+vec4 calculateBorderColor(TileData tileData, vec2 uv)
+{
+  if (u_hasFocusedPlayer > 0.0f && tileData.ownerId == uint(u_focusedPlayerId)) 
+  {
+    return vec4(u_focusedBorderColor, u_territoryAlpha);
+  } 
+  else if (tileData.hasDefenseBonus)
+  {
+    return calculateDefendedBorderColor(tileData.ownerId, uv);
+  }
+  else
+  {
+    return getPlayerColor(tileData.ownerId, PLAYER_COLOR_BORDER);
+  }
+}
+
+ 
+//
+// GPU based tile color shading
+//
+
+vec4 territoryColor()
+{
+    vec4 result;
+    TileData thisTile = ThisTile();
     
-    // Helper function to get owner ID from owner texture
-    int getOwnerId(vec2 coord) {
-      vec4 ownerData = texture2D(u_ownerTexture, coord);
-      // Owner ID is encoded in the red channel (0-255 range)
-      return int(ownerData.r * 255.0);
+    if (thisTile.isFallout)
+    {
+      result = vec4(u_falloutColor.rgb, u_territoryAlpha);
     }
-    
-    // Check if a pixel is a border by comparing with neighbors
-    bool isBorder(vec2 coord, int ownerId) {
-      vec2 texelSize = 1.0 / u_textureSize;
-      
-      // Check 4-connected neighbors
-      vec2 neighbors[4];
-      neighbors[0] = coord + vec2(-texelSize.x, 0.0); // left
-      neighbors[1] = coord + vec2(texelSize.x, 0.0);  // right
-      neighbors[2] = coord + vec2(0.0, -texelSize.y); // up
-      neighbors[3] = coord + vec2(0.0, texelSize.y);  // down
-      
-      for (int i = 0; i < 4; i++) {
-        // Check bounds
-        if (neighbors[i].x < 0.0 || neighbors[i].x > 1.0 || 
-            neighbors[i].y < 0.0 || neighbors[i].y > 1.0) {
-          return true; // Edge of map is considered border
-        }
-        
-        int neighborOwnerId = getOwnerId(neighbors[i]);
-        if (neighborOwnerId != ownerId) {
-          return true;
-        }
-      }
-      
-      return false;
+    else if (thisTile.ownerId == UNOWNED_TERRITORY_ID)
+    {
+      result = vec4(0.0);
     }
-    
-    // Compute border color by darkening the territory color
-    vec3 computeBorderColor(vec3 territoryColor) {
-      // Darken the territory color for border (similar to theme.borderColor logic)
-      return territoryColor * 0.7; // Darken by 30%
+    else if (isBorder(v_texCoord, thisTile.ownerId))
+    {
+      result = calculateBorderColor(thisTile, v_texCoord);
     }
-    
-    void main() {
-      vec4 territoryColor = texture2D(u_texture, v_texCoord);
-      
-      // If pixel is transparent, just return it
-      if (territoryColor.a == 0.0) {
-        gl_FragColor = territoryColor;
-        return;
-      }
-      
-      int ownerId = getOwnerId(v_texCoord);
-      
-      // Check if this pixel is a border
-      if (isBorder(v_texCoord, ownerId)) {
-        // Check if this is the focused player's border
-        if (u_hasFocusedPlayer > 0.5 && ownerId == u_focusedPlayerId) {
-          gl_FragColor = vec4(u_focusedBorderColor, 1.0);
-        } else {
-          // Compute border color from territory color
-          vec3 borderColor = computeBorderColor(territoryColor.rgb);
-          gl_FragColor = vec4(borderColor, 1.0);
-        }
-      } else {
-        // Regular territory color
-        gl_FragColor = territoryColor;
-      }
+    else
+    {
+        result = getPlayerColor(thisTile.ownerId, PLAYER_COLOR_TERRITORY);
     }
-  `;
+
+    if (debug_draw_tiles)
+    {
+      result = DebugDrawTileData(result);
+    }
+    return result;
+}
+
+//
+// Debug visualizations of input data
+//
+vec4 DebugDrawPalette(vec4 inColor, vec2 offset)
+{
+  int mipLevel = 0;
+  int debugTileSize = 1;
+  ivec2 textureDims = textureSize(u_tileTexture, mipLevel);
+  ivec2 pixelCoord = ivec2(floor(v_texCoord * vec2(textureDims)));
+  ivec2 paletteTextureDims = textureSize(u_paletteTexture, mipLevel);
+  pixelCoord.x >>= debugTileSize;
+  pixelCoord.y >>= debugTileSize; 
+
+  if (any(lessThan(pixelCoord, ivec2(0, 0))) || any(greaterThanEqual(pixelCoord, paletteTextureDims)))
+    return inColor;
+
+  vec3 paletteColor = texelFetch(u_paletteTexture, pixelCoord, mipLevel).rgb;
+  return vec4(paletteColor, 1.0);
+}
+
+
+ivec2 fragmentCoordinates()
+{
+  int mipLevel = 0;
+  ivec2 textureDimensions = textureSize(u_tileTexture, mipLevel);
+  ivec2 pixelCoord = ivec2(floor(v_texCoord * vec2(textureDimensions)));
+  return pixelCoord;
+}
+
+void main() 
+{
+  fragColor = territoryColor();
+
+  // Composite debug layers on top
+  if (debug_draw_palette)
+  {
+    fragColor = DebugDrawPalette(fragColor, vec2(0.0, 0.0));
+  }
+}
+`;
 
   constructor(
     private game: GameView,
@@ -170,57 +344,16 @@ export class WebGLTerritoryLayer implements Layer {
     return true;
   }
 
-  async paintPlayerBorder(player: PlayerView) {
-    const tiles = await player.borderTiles();
-    tiles.borderTiles.forEach((tile: TileRef) => {
-      this.paintTerritory(tile, true);
-    });
+  paintHighlightTile(tile: TileRef, color: Colord, alpha: number) {
+    const x = this.game.x(tile);
+    const y = this.game.y(tile);
+    this.highlightContext.fillStyle = color.alpha(alpha / 255).toRgbString();
+    this.highlightContext.fillRect(x, y, 1, 1);
   }
 
-  tick() {
-    const prev = this.cachedTerritoryPatternsEnabled;
-    this.cachedTerritoryPatternsEnabled = this.userSettings.territoryPatterns();
-    if (prev !== undefined && prev !== this.cachedTerritoryPatternsEnabled) {
-      this.eventBus.emit(new RefreshGraphicsEvent());
-    }
-
-    this.game.recentlyUpdatedTiles().forEach((t) => this.enqueueTile(t));
-    const updates = this.game.updatesSinceLastTick();
-    const unitUpdates = updates !== null ? updates[GameUpdateType.Unit] : [];
-    unitUpdates.forEach((update) => {
-      if (update.unitType === UnitType.DefensePost) {
-        const tile = update.pos;
-        this.game
-          .bfs(tile, euclDistFN(tile, this.game.config().defensePostRange()))
-          .forEach((t) => {
-            if (
-              this.game.isBorder(t) &&
-              (this.game.ownerID(t) === update.ownerID ||
-                this.game.ownerID(t) === update.lastOwnerID)
-            ) {
-              this.enqueueTile(t);
-            }
-          });
-      }
-    });
-
-    const focusedPlayer = this.game.focusedPlayer();
-    if (focusedPlayer !== this.lastFocusedPlayer) {
-      if (this.lastFocusedPlayer) {
-        this.paintPlayerBorder(this.lastFocusedPlayer);
-      }
-      if (focusedPlayer) {
-        this.paintPlayerBorder(focusedPlayer);
-      }
-      this.lastFocusedPlayer = focusedPlayer;
-    }
-
-    if (!this.game.inSpawnPhase()) {
-      return;
-    }
-    if (this.game.ticks() % 5 === 0) {
-      return;
-    }
+  paintHighlightLayer() {
+    if (!this.game.inSpawnPhase()) return;
+    if (this.game.ticks() % 5 === 0) return;
 
     this.highlightContext.clearRect(
       0,
@@ -228,6 +361,7 @@ export class WebGLTerritoryLayer implements Layer {
       this.game.width(),
       this.game.height(),
     );
+
     const humans = this.game
       .playerViews()
       .filter((p) => p.type() === PlayerType.Human);
@@ -261,14 +395,28 @@ export class WebGLTerritoryLayer implements Layer {
     }
   }
 
+  publishGameUpdates() {
+    const updates = this.game.updatesSinceLastTick();
+
+    // TODO - publish recently updated tiles to the GPU as buffer data for scatter-write
+    const tileUpdates = updates?.[GameUpdateType.Tile] ?? [];
+    const unitUpdates = updates?.[GameUpdateType.Unit] ?? [];
+  }
+
+  tick() {
+    this.publishGameUpdates();
+    this.paintHighlightLayer();
+  }
+
   init() {
-    this.eventBus.on(AlternateViewEvent, (e) => {
-      this.alternativeView = e.alternateView;
-    });
-    this.eventBus.on(DragEvent, (e) => {
-      // TODO: consider re-enabling this on mobile or low end devices for smoother dragging.
-      // this.lastDragTime = Date.now();
-    });
+    this.eventBus.on(
+      AlternateViewEvent,
+      (e) => (this.alternativeView = e.alternateView),
+    );
+
+    // TODO: consider re-enabling this on mobile or low end devices for smoother dragging.
+    // this.eventBus.on(DragEvent, (e) =>
+    //   this.lastDragTime = Date.now());
 
     if (this.initWebGL()) {
       this.redraw();
@@ -279,34 +427,37 @@ export class WebGLTerritoryLayer implements Layer {
     // Set up highlight canvas dimensions
     this.highlightCanvas.width = this.game.width();
     this.highlightCanvas.height = this.game.height();
-
-    // Initialize texture data and render all territories
-    this.initTextureData();
-    this.initOwnerTextureData();
-    this.game.forEachTile((t) => {
-      this.paintTerritory(t);
-    });
-    this.uploadTextureData();
     this.needsRedraw = true;
   }
 
+  stageAllGpuData() {
+    this.colorPalette?.updateCpuData();
+    this.updateTileTextureData();
+
+    const focusedPlayer = this.game.focusedPlayer();
+    this.uniforms.ui["u_hasFocusedPlayer"] = focusedPlayer ? 1.0 : 0.0;
+    this.uniforms.ui["u_focusedPlayerId"] = focusedPlayer?.smallID() ?? 0;
+  }
+
+  uploadAllDataToGPU() {
+    if (!this.gl) return;
+    // Initialize texture data and render all territories
+    this.colorPalette?.uploadToGpu(this.gl);
+    this.tileTextureData?.uploadChangesToGpu();
+  }
+
   renderLayer(context: CanvasRenderingContext2D) {
+    if (this.alternativeView) return;
     const now = Date.now();
     if (
       now > this.lastDragTime + this.nodrawDragDuration &&
       now > this.lastRefresh + this.refreshRate
     ) {
-      this.lastRefresh = now;
-      this.renderTerritory();
-    }
-
-    if (this.needsRedraw) {
+      this.stageAllGpuData();
+      this.uploadAllDataToGPU();
       this.renderToCanvas();
-      this.needsRedraw = false;
-    }
-
-    if (this.alternativeView) {
-      return;
+      this.lastRefresh = now;
+      console.log("🎨 renderLayer - Stage and upload");
     }
 
     context.drawImage(
@@ -332,20 +483,51 @@ export class WebGLTerritoryLayer implements Layer {
     this.canvas.width = this.game.width();
     this.canvas.height = this.game.height();
 
-    this.gl = this.canvas.getContext("webgl") as WebGLRenderingContext | null;
+    const gl = (this.gl = this.canvas.getContext(
+      "webgl2",
+    ) as WebGL2RenderingContext);
     if (!this.gl) {
       console.error("Failed to get WebGL context");
       return false;
     }
+    const game = this.game;
+    const [width, height] = [game.width(), game.height()];
 
+    const program = (this.program = WebGLTerritoryLayer.createProgram(gl));
+    const vertexBuffer = (this.vertexBuffer =
+      WebGLTerritoryLayer.createVertexBuffer(gl));
+    this.uniformSetter = WebGLTerritoryLayer.bindProgram(
+      gl,
+      this.program,
+      vertexBuffer,
+    );
+    this.tileTextureData = WebGLTerritoryLayer.createTileTexture(
+      gl,
+      width,
+      height,
+    );
+    this.colorPalette = WebGLTerritoryLayer.createColorPalette(gl, game);
+
+    // Initialize constant shader uniform parameters
+    this.uniforms.sampler["u_paletteTexture"] = 0;
+    this.uniforms.sampler["u_tileTexture"] = 1;
+
+    this.uniforms.debug["debug_draw_palette"] = true;
+    this.uniforms.debug["debug_draw_tiles"] = false;
+    this.uniforms.debug["debug_draw_cpu_percent"] = 0.75;
+
+    return true;
+  }
+
+  private static createProgram(gl: WebGL2RenderingContext): WebGLProgram {
     const vertexShader = WebGLUtils.createShader(
-      this.gl,
-      this.gl.VERTEX_SHADER,
+      gl,
+      gl.VERTEX_SHADER,
       WebGLTerritoryLayer.VERTEX_SHADER_SOURCE,
     );
     const fragmentShader = WebGLUtils.createShader(
-      this.gl,
-      this.gl.FRAGMENT_SHADER,
+      gl,
+      gl.FRAGMENT_SHADER,
       WebGLTerritoryLayer.FRAGMENT_SHADER_SOURCE,
     );
 
@@ -355,16 +537,23 @@ export class WebGLTerritoryLayer implements Layer {
     }
 
     // Create program
-    this.program = WebGLUtils.createProgram(
-      this.gl,
-      vertexShader,
-      fragmentShader,
-    );
-    if (!this.program) {
-      console.error("Failed to create shader program");
-      return false;
+    const program = WebGLUtils.createProgram(gl, vertexShader, fragmentShader);
+    if (!program) {
+      throw new Error("Failed to create shader program");
     }
+    return program;
+  }
 
+  private static createColorPalette(
+    gl: WebGL2RenderingContext,
+    game: GameView,
+  ) {
+    const colorPalette = new ColorPalette();
+    colorPalette.init(gl, game);
+    return colorPalette;
+  }
+
+  private static createVertexBuffer(gl: WebGL2RenderingContext): WebGLBuffer {
     // Format: [x, y, u, v] for each vertex
     const vertexData = new Float32Array([
       // Position    // Texture coords
@@ -372,215 +561,90 @@ export class WebGLTerritoryLayer implements Layer {
       -1.0,
       0.0,
       1.0, // Bottom left
-      1.0,
+      +1.0,
       -1.0,
       1.0,
       1.0, // Bottom right
       -1.0,
-      1.0,
+      +1.0,
       0.0,
       0.0, // Top left
-      1.0,
-      1.0,
+      +1.0,
+      +1.0,
       1.0,
       0.0, // Top right
     ]);
 
-    this.vertexBuffer = this.gl.createBuffer();
-    this.gl.bindBuffer(this.gl.ARRAY_BUFFER, this.vertexBuffer);
-    this.gl.bufferData(this.gl.ARRAY_BUFFER, vertexData, this.gl.STATIC_DRAW);
+    const vertexBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, vertexBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, vertexData, gl.STATIC_DRAW);
+    return vertexBuffer;
+  }
 
-    const positionAttributeLocation = this.gl.getAttribLocation(
-      this.program,
+  private static bindProgram(
+    gl: WebGL2RenderingContext,
+    program: WebGLProgram,
+    vertexBuffer: WebGLBuffer,
+  ): UniformSetter {
+    const positionAttributeLocation = gl.getAttribLocation(
+      program,
       "a_position",
     );
-    this.gl.enableVertexAttribArray(positionAttributeLocation);
-    this.gl.vertexAttribPointer(
+    gl.enableVertexAttribArray(positionAttributeLocation);
+    gl.vertexAttribPointer(
       positionAttributeLocation,
       2, // 2 components per vertex (x, y)
-      this.gl.FLOAT,
+      gl.FLOAT,
       false,
       4 * 4, // stride: 4 floats * 4 bytes per float
       0, // offset: start at beginning
     );
 
     // Set up texture coordinate attribute
-    const texCoordAttributeLocation = this.gl.getAttribLocation(
-      this.program,
+    const texCoordAttributeLocation = gl.getAttribLocation(
+      program,
       "a_texCoord",
     );
-    this.gl.enableVertexAttribArray(texCoordAttributeLocation);
-    this.gl.vertexAttribPointer(
+    gl.enableVertexAttribArray(texCoordAttributeLocation);
+    gl.vertexAttribPointer(
       texCoordAttributeLocation,
       2, // 2 components per vertex (u, v)
-      this.gl.FLOAT,
+      gl.FLOAT,
       false,
       4 * 4, // stride: 4 floats * 4 bytes per float
       2 * 4, // offset: skip 2 floats (x, y) to get to texture coords
     );
-
-    // Create territory texture
-    this.texture = this.createTerritoryTexture();
-    if (!this.texture) {
-      console.error("Failed to create territory texture");
-      return false;
-    }
-
-    this.ownerTexture = this.createOwnerTexture();
-    if (!this.ownerTexture) {
-      console.error("Failed to create owner texture");
-      return false;
-    }
-    this.textureUniformLocation = this.gl.getUniformLocation(
-      this.program,
-      "u_texture",
-    );
-    this.ownerTextureUniformLocation = this.gl.getUniformLocation(
-      this.program,
-      "u_ownerTexture",
-    );
-    this.textureSizeUniformLocation = this.gl.getUniformLocation(
-      this.program,
-      "u_textureSize",
-    );
-    this.focusedBorderColorUniformLocation = this.gl.getUniformLocation(
-      this.program,
-      "u_focusedBorderColor",
-    );
-    this.hasFocusedPlayerUniformLocation = this.gl.getUniformLocation(
-      this.program,
-      "u_hasFocusedPlayer",
-    );
-    this.focusedPlayerIdUniformLocation = this.gl.getUniformLocation(
-      this.program,
-      "u_focusedPlayerId",
-    );
-
-    return true;
+    return new UniformSetter(gl, program);
   }
 
-  private createTerritoryTexture(): WebGLTexture | null {
-    if (!this.gl) {
-      return null;
-    }
-
-    const width = this.game.width();
-    const height = this.game.height();
-    this.textureData = new Uint8Array(width * height * 4); // RGBA
-
-    // Initialize with transparent pixels
-    this.initTextureData();
-
-    const texture = WebGLUtils.createTexture(
-      this.gl,
+  private static createTileTexture(
+    gl: WebGL2RenderingContext,
+    width: number,
+    height: number,
+  ): TextureData {
+    return new TextureData(
+      gl,
       width,
       height,
-      this.textureData,
+      2,
+      gl.R16UI,
+      gl.RED_INTEGER,
+      gl.UNSIGNED_SHORT,
     );
-    return texture;
   }
 
-  private createOwnerTexture(): WebGLTexture | null {
-    if (!this.gl) {
-      return null;
-    }
-
-    const width = this.game.width();
-    const height = this.game.height();
-    this.ownerTextureData = new Uint8Array(width * height * 4); // RGBA
-    this.initOwnerTextureData();
-
-    const texture = WebGLUtils.createTexture(
-      this.gl,
-      width,
-      height,
-      this.ownerTextureData,
-    );
-    return texture;
-  }
-
-  private initTextureData() {
-    if (!this.textureData) {
-      return;
-    }
-
-    // Initialize all pixels as transparent
-    this.game.forEachTile((tile) => {
-      const cell = new Cell(this.game.x(tile), this.game.y(tile));
-      const index = cell.y * this.game.width() + cell.x;
-      const offset = index * 4;
-      this.textureData![offset + 3] = 0; // Set alpha to 0 (fully transparent)
-    });
-  }
-
-  private initOwnerTextureData() {
-    if (!this.ownerTextureData) {
-      return;
-    }
-
-    // Initialize owner texture with owner IDs
-    this.game.forEachTile((tile) => {
-      const cell = new Cell(this.game.x(tile), this.game.y(tile));
-      const index = cell.y * this.game.width() + cell.x;
-      const offset = index * 4;
-
-      if (this.game.hasOwner(tile)) {
-        const ownerId = this.game.ownerID(tile);
-        // Encode owner ID in red channel (0-255 range)
-        this.ownerTextureData![offset] = Math.min(255, Math.max(0, ownerId));
-        this.ownerTextureData![offset + 1] = 0; // Green channel unused
-        this.ownerTextureData![offset + 2] = 0; // Blue channel unused
-        this.ownerTextureData![offset + 3] = 255; // Full alpha
-      } else {
-        // No owner - set to transparent
-        this.ownerTextureData![offset] = 0;
-        this.ownerTextureData![offset + 1] = 0;
-        this.ownerTextureData![offset + 2] = 0;
-        this.ownerTextureData![offset + 3] = 0;
-      }
-    });
-  }
-
-  private uploadTextureData() {
-    if (!this.gl || !this.texture || !this.textureData) {
-      return;
-    }
-
-    this.gl.activeTexture(this.gl.TEXTURE0);
-    this.gl.bindTexture(this.gl.TEXTURE_2D, this.texture);
-    this.gl.texImage2D(
-      this.gl.TEXTURE_2D,
-      0, // mip level
-      this.gl.RGBA,
-      this.game.width(),
-      this.game.height(),
-      0, // border
-      this.gl.RGBA,
-      this.gl.UNSIGNED_BYTE,
-      this.textureData,
-    );
-
-    if (this.ownerTexture && this.ownerTextureData) {
-      this.gl.activeTexture(this.gl.TEXTURE1);
-      this.gl.bindTexture(this.gl.TEXTURE_2D, this.ownerTexture);
-      this.gl.texImage2D(
-        this.gl.TEXTURE_2D,
-        0,
-        this.gl.RGBA,
-        this.game.width(),
-        this.game.height(),
-        0,
-        this.gl.RGBA,
-        this.gl.UNSIGNED_BYTE,
-        this.ownerTextureData,
-      );
-    }
+  private updateTileTextureData() {
+    if (!this.tileTextureData) return;
+    const ownerBuffer = (this.game as GameView).ownerBuffer();
+    const ownerBufferView = ownerBuffer.subarray(0, ownerBuffer.length);
+    this.tileTextureData.bytes = ownerBufferView;
   }
 
   private renderToCanvas(): void {
-    if (!this.gl || !this.program || !this.texture) {
-      return;
-    }
+    if (!this.gl) return;
+    if (!this.program) return;
+    if (!this.uniformSetter) return;
+    if (!this.colorPalette) return;
 
     this.gl.viewport(0, 0, this.canvas.width, this.canvas.height);
 
@@ -592,234 +656,28 @@ export class WebGLTerritoryLayer implements Layer {
     this.gl.clear(this.gl.COLOR_BUFFER_BIT);
     this.gl.useProgram(this.program);
 
-    // Bind territory texture to texture unit 0
-    this.gl.activeTexture(this.gl.TEXTURE0);
-    this.gl.bindTexture(this.gl.TEXTURE_2D, this.texture);
-    if (this.textureUniformLocation) {
-      this.gl.uniform1i(this.textureUniformLocation, 0);
-    }
+    this.colorPalette.textureData!.bindToTextureUnit(
+      this.uniforms.sampler["u_paletteTexture"],
+    );
+    this.tileTextureData!.bindToTextureUnit(
+      this.uniforms.sampler["u_tileTexture"],
+    );
 
-    // Bind owner texture to texture unit 1
-    if (this.ownerTexture && this.ownerTextureUniformLocation) {
-      this.gl.activeTexture(this.gl.TEXTURE1);
-      this.gl.bindTexture(this.gl.TEXTURE_2D, this.ownerTexture);
-      this.gl.uniform1i(this.ownerTextureUniformLocation, 1);
-    }
-
-    // Set texture size uniform
-    if (this.textureSizeUniformLocation) {
-      this.gl.uniform2f(
-        this.textureSizeUniformLocation,
-        this.game.width(),
-        this.game.height(),
-      );
-    }
-
-    const focusedPlayer = this.game.focusedPlayer();
-    if (
-      focusedPlayer &&
-      this.focusedBorderColorUniformLocation &&
-      this.hasFocusedPlayerUniformLocation &&
-      this.focusedPlayerIdUniformLocation
-    ) {
-      this.gl.uniform1f(this.hasFocusedPlayerUniformLocation, 1.0);
-
-      const playerId = focusedPlayer.smallID();
-      this.gl.uniform1i(this.focusedPlayerIdUniformLocation, playerId);
-
-      const focusedBorderColor = this.theme.focusedBorderColor();
-      this.gl.uniform3f(
-        this.focusedBorderColorUniformLocation,
-        focusedBorderColor.rgba.r / 255.0,
-        focusedBorderColor.rgba.g / 255.0,
-        focusedBorderColor.rgba.b / 255.0,
-      );
-    } else {
-      if (this.hasFocusedPlayerUniformLocation) {
-        this.gl.uniform1f(this.hasFocusedPlayerUniformLocation, 0.0);
-      }
-    }
+    // Upload all uniform parameters
+    this.uniformSetter.set(this.colorPalette!.uniforms);
+    this.uniformSetter.set(this.uniforms.sampler);
+    this.uniformSetter.set(this.uniforms.ui);
+    this.uniformSetter.set(this.uniforms.debug);
 
     // Draw the textured quad
     this.gl.drawArrays(this.gl.TRIANGLE_STRIP, 0, 4);
   }
 
-  private renderTerritory() {
-    let numToRender = Math.floor(this.tileToRenderQueue.size() / 10);
-    if (numToRender === 0 || this.game.inSpawnPhase()) {
-      numToRender = this.tileToRenderQueue.size();
-    }
-
-    let needsUpload = false;
-
-    while (numToRender > 0) {
-      numToRender--;
-
-      const entry = this.tileToRenderQueue.pop();
-      if (!entry) {
-        break;
-      }
-
-      const tile = entry.tile;
-      this.paintTerritory(tile);
-      needsUpload = true;
-
-      for (const neighbor of this.game.neighbors(tile)) {
-        this.paintTerritory(neighbor, true);
-      }
-    }
-
-    if (needsUpload) {
-      this.uploadTextureData();
-      this.needsRedraw = true;
-    }
-  }
-
-  paintTerritory(tile: TileRef, isBorder: boolean = false) {
-    if (isBorder && !this.game.hasOwner(tile)) {
-      return;
-    }
-    if (!this.game.hasOwner(tile)) {
-      if (this.game.hasFallout(tile)) {
-        this.paintTile(tile, this.theme.falloutColor(), 150);
-        return;
-      }
-      this.clearTile(tile);
-      return;
-    }
-
-    const owner = this.game.owner(tile) as PlayerView;
-    if (this.game.isBorder(tile)) {
-      const playerIsFocused = owner && this.game.focusedPlayer() === owner;
-      if (
-        this.game.hasUnitNearby(
-          tile,
-          this.game.config().defensePostRange(),
-          UnitType.DefensePost,
-          owner.id(),
-        )
-      ) {
-        const borderColors = this.theme.defendedBorderColors(owner);
-        const x = this.game.x(tile);
-        const y = this.game.y(tile);
-        const lightTile =
-          (x % 2 === 0 && y % 2 === 0) || (y % 2 === 1 && x % 2 === 1);
-        const borderColor = lightTile ? borderColors.light : borderColors.dark;
-        this.paintTile(tile, borderColor, 255);
-      } else {
-        const useBorderColor = playerIsFocused
-          ? this.theme.focusedBorderColor()
-          : this.theme.borderColor(owner);
-        this.paintTile(tile, useBorderColor, 255);
-      }
-    } else {
-      const pattern = owner.cosmetics.pattern;
-      const patternsEnabled = this.cachedTerritoryPatternsEnabled ?? false;
-
-      if (pattern === undefined || patternsEnabled === false) {
-        const territoryColor = this.theme.territoryColor(owner);
-        this.paintTile(tile, territoryColor, 150);
-      } else {
-        const x = this.game.x(tile);
-        const y = this.game.y(tile);
-        const baseColor = this.theme.territoryColor(owner);
-
-        const decoder = owner.patternDecoder();
-        const color = decoder?.isSet(x, y)
-          ? baseColor.darken(0.125)
-          : baseColor;
-        this.paintTile(tile, color, 150);
-      }
-    }
-  }
-
-  paintTile(tile: TileRef, color: Colord, alpha: number) {
-    if (!this.textureData) {
-      return;
-    }
-
-    const offset = tile * 4;
-    this.textureData[offset] = color.rgba.r;
-    this.textureData[offset + 1] = color.rgba.g;
-    this.textureData[offset + 2] = color.rgba.b;
-    this.textureData[offset + 3] = alpha;
-    this.updateOwnerTile(tile);
-  }
-
-  clearTile(tile: TileRef) {
-    if (!this.textureData) {
-      return;
-    }
-
-    const offset = tile * 4;
-    this.textureData[offset + 3] = 0;
-    this.updateOwnerTile(tile);
-  }
-
-  private updateOwnerTile(tile: TileRef) {
-    if (!this.ownerTextureData) {
-      return;
-    }
-
-    const offset = tile * 4;
-
-    if (this.game.hasOwner(tile)) {
-      const ownerId = this.game.ownerID(tile);
-      // Encode owner ID in red channel (0-255 range)
-      this.ownerTextureData[offset] = Math.min(255, Math.max(0, ownerId));
-      this.ownerTextureData[offset + 1] = 0; // Green channel unused
-      this.ownerTextureData[offset + 2] = 0; // Blue channel unused
-      this.ownerTextureData[offset + 3] = 255; // Full alpha
-    } else {
-      // No owner - set to transparent
-      this.ownerTextureData[offset] = 0;
-      this.ownerTextureData[offset + 1] = 0;
-      this.ownerTextureData[offset + 2] = 0;
-      this.ownerTextureData[offset + 3] = 0;
-    }
-  }
-
-  enqueueTile(tile: TileRef) {
-    this.tileToRenderQueue.push({
-      tile: tile,
-      lastUpdate: this.game.ticks() + this.random.nextFloat(0, 0.5),
-    });
-  }
-
-  async enqueuePlayerBorder(player: PlayerView) {
-    const playerBorderTiles = await player.borderTiles();
-    playerBorderTiles.borderTiles.forEach((tile: TileRef) => {
-      this.enqueueTile(tile);
-    });
-  }
-
-  paintHighlightTile(tile: TileRef, color: Colord, alpha: number) {
-    this.clearTile(tile);
-    const x = this.game.x(tile);
-    const y = this.game.y(tile);
-    this.highlightContext.fillStyle = color.alpha(alpha / 255).toRgbString();
-    this.highlightContext.fillRect(x, y, 1, 1);
-  }
-
-  clearHighlightTile(tile: TileRef) {
-    const x = this.game.x(tile);
-    const y = this.game.y(tile);
-    this.highlightContext.clearRect(x, y, 1, 1);
-  }
+  private renderGpuOnly = false;
 
   dispose() {
     if (!this.gl) {
       return;
-    }
-
-    if (this.texture) {
-      this.gl.deleteTexture(this.texture);
-      this.texture = null;
-    }
-
-    if (this.ownerTexture) {
-      this.gl.deleteTexture(this.ownerTexture);
-      this.ownerTexture = null;
     }
 
     if (this.vertexBuffer) {
@@ -832,8 +690,15 @@ export class WebGLTerritoryLayer implements Layer {
       this.program = null;
     }
 
-    this.textureData = null;
-    this.ownerTextureData = null;
+    this.colorPalette?.dispose();
+    this.colorPalette = null;
+
+    this.paletteTextureData = null;
+    this.tileTextureData?.dispose();
+    this.tileTextureData = null;
+
+    this.uniformSetter?.dispose();
+    this.uniformSetter = null;
 
     this.gl = null;
   }

@@ -23,7 +23,6 @@ export interface GameMap {
   // State getters and setters (mutable)
   ownerID(ref: TileRef): number;
   hasOwner(ref: TileRef): boolean;
-
   setOwnerID(ref: TileRef, playerId: number): void;
   hasFallout(ref: TileRef): boolean;
   setFallout(ref: TileRef, value: boolean): void;
@@ -175,6 +174,10 @@ export class GameMapImpl implements GameMap {
 
   hasOwner(ref: TileRef): boolean {
     return this.ownerID(ref) !== 0;
+  }
+
+  ownerBuffer(): Uint16Array {
+    return this.state;
   }
 
   setOwnerID(ref: TileRef, playerId: number): void {

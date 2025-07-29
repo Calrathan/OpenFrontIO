@@ -224,13 +224,20 @@ export function createRenderer(
   }
   alertFrame.game = game;
 
-  const layers: Layer[] = [
+  // Factory functions for cleaner layer construction
+  const createTerrainLayer = () =>
     userSettings.useWebGL()
       ? new WebGLTerrainLayer(game, transformHandler)
-      : new TerrainLayer(game, transformHandler),
+      : new TerrainLayer(game, transformHandler);
+
+  const createTerritoryLayer = () =>
     userSettings.useWebGL()
       ? new WebGLTerritoryLayer(game, eventBus, transformHandler, userSettings)
-      : new TerritoryLayer(game, eventBus, transformHandler, userSettings),
+      : new TerritoryLayer(game, eventBus, transformHandler, userSettings);
+
+  const layers: Layer[] = [
+    createTerrainLayer(),
+    createTerritoryLayer(),
     new RailroadLayer(game),
     structureLayer,
     new StructureIconsLayer(game, eventBus, transformHandler),

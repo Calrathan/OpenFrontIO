@@ -168,6 +168,15 @@ export class UserSettingModal extends LitElement {
     console.log("🏳️ Territory Patterns:", enabled ? "ON" : "OFF");
   }
 
+  private toggleWebGL(e: CustomEvent<{ checked: boolean }>) {
+    const enabled = e.detail?.checked;
+    if (typeof enabled !== "boolean") return;
+
+    this.userSettings.set("settings.webGL", enabled);
+
+    console.log("🖥️ WebGL:", enabled ? "ON" : "OFF");
+  }
+
   private handleKeybindChange(
     e: CustomEvent<{ action: string; value: string }>,
   ) {
@@ -319,6 +328,15 @@ export class UserSettingModal extends LitElement {
         100}
         @change=${this.sliderTroopRatio}
       ></setting-slider>
+
+      <!-- 🖥️ WebGL -->
+      <setting-toggle
+        label="${"🐞 UseWebGL"}"
+        description="${"Debug - Use WebGL to shade terrain"}"
+        id="webgl-toggle"
+        .checked=${this.userSettings.useWebGL()}
+        @change=${this.toggleWebGL}
+      ></setting-toggle>
 
       ${this.showEasterEggSettings
         ? html`
