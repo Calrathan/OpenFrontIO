@@ -1,3 +1,4 @@
+import { Colord } from "colord";
 import { WebGLUtils } from "./WebGLUtils";
 
 // Type definitions for uniform values
@@ -129,6 +130,8 @@ export function setUniform(
   uniformInfo?: WebGLActiveInfo | null,
   name?: string,
 ): void {
+  const GL = WebGLRenderingContext;
+  const GL2 = WebGL2RenderingContext;
   try {
     // Debug: Check if any program is bound
     const currentProgram = gl.getParameter(gl.CURRENT_PROGRAM);
@@ -138,6 +141,11 @@ export function setUniform(
       );
       return;
     }
+    if (!uniformInfo)
+      throw new Error(`No uniform info available for ${name ?? "unknown"}`);
+    if (!location)
+      throw new Error(`No location available for ${name ?? "unknown"}`);
+
     if (value instanceof Float32Array) {
       switch (value.length) {
         case 1:
@@ -179,216 +187,198 @@ export function setUniform(
           throw new Error(`Unsupported Int32Array length: ${value.length}`);
       }
     } else if (typeof value === "number") {
-      // Use introspection to determine if this should be int, uint, or float
-      if (uniformInfo) {
-        switch (uniformInfo.type) {
-          case gl.SAMPLER_2D:
-          case gl.SAMPLER_CUBE:
-          case gl instanceof WebGL2RenderingContext
-            ? (gl as WebGL2RenderingContext).SAMPLER_2D_ARRAY
-            : undefined:
-          case gl instanceof WebGL2RenderingContext
-            ? (gl as WebGL2RenderingContext).UNSIGNED_INT_SAMPLER_2D
-            : undefined:
-          case gl instanceof WebGL2RenderingContext
-            ? (gl as WebGL2RenderingContext).INT_SAMPLER_2D
-            : undefined:
-            gl.uniform1i(location, Math.floor(value));
-            break;
-          case gl.FLOAT:
-            gl.uniform1f(location, value);
-            break;
-          case gl.INT:
-            gl.uniform1i(location, Math.floor(value));
-            break;
-          case gl.INT_VEC2:
-          case gl.INT_VEC3:
-          case gl.INT_VEC4:
-            throw new Error(
-              `Tried to set a scalar into a vector field: ${uniformInfo.type} ${uniformInfo.name}`,
-            );
-            break;
-          case gl instanceof WebGL2RenderingContext
-            ? gl.UNSIGNED_INT
-            : undefined:
-            (gl as WebGL2RenderingContext).uniform1ui(
-              location,
-              Math.max(0, Math.floor(value)),
-            );
-            break;
-          case gl.BOOL:
-            gl.uniform1i(location, value ? 1 : 0);
-            break;
-          default:
-            break;
-        }
-      } else {
-        // Fallback to float if no introspection available
-        gl.uniform1f(location, value);
+      switch (uniformInfo.type) {
+        case GL.SAMPLER_2D:
+          gl.uniform1i(location, value | 0);
+          break;
+        case GL.SAMPLER_CUBE:
+          gl.uniform1i(location, value | 0);
+          break;
+        case GL2.SAMPLER_2D_ARRAY:
+          gl.uniform1i(location, value | 0);
+          break;
+        case GL2.UNSIGNED_INT_SAMPLER_2D:
+          gl.uniform1i(location, value | 0);
+          break;
+        case GL2.INT_SAMPLER_2D:
+          gl.uniform1i(location, value | 0);
+          break;
+        case GL.FLOAT:
+          gl.uniform1f(location, value);
+          break;
+        case GL.INT:
+          gl.uniform1i(location, value | 0);
+          break;
+        case GL.BOOL:
+          gl.uniform1i(location, value ? 1 : 0);
+          break;
+        case GL.INT_VEC2:
+          throw new Error(
+            `Tried to set a scalar into a vector field: ${uniformInfo.type} ${uniformInfo.name}`,
+          );
+        case GL.INT_VEC3:
+          throw new Error(
+            `Tried to set a scalar into a vector field: ${uniformInfo.type} ${uniformInfo.name}`,
+          );
+        case GL.INT_VEC4:
+          throw new Error(
+            `Tried to set a scalar into a vector field: ${uniformInfo.type} ${uniformInfo.name}`,
+          );
+        case GL2.UNSIGNED_INT:
+          (gl as WebGL2RenderingContext).uniform1ui(
+            location,
+            value < 0 ? 0 : value | 0,
+          );
+          break;
+        default:
+          break;
       }
     } else if (typeof value === "boolean") {
-      gl.uniform1i(location, value ? 1 : 0);
-    } else if (Array.isArray(value)) {
-      // Use introspection to determine if this should be int or float vectors
-      if (uniformInfo) {
-        switch (uniformInfo.type) {
-          case gl.INT_VEC2:
-            if (value.length === 2) {
-              gl.uniform2i(
-                location,
-                Math.floor(value[0]),
-                Math.floor(value[1]),
-              );
-            } else {
-              throw new Error(
-                `Expected 2 values for INT_VEC2, got ${value.length} ${uniformInfo.name}`,
-              );
-            }
-            break;
-          case gl.INT_VEC3:
-            if (value.length === 3) {
-              gl.uniform3i(
-                location,
-                Math.floor(value[0]),
-                Math.floor(value[1]),
-                Math.floor(value[2]),
-              );
-            } else {
-              throw new Error(
-                `Expected 3 values for INT_VEC3, got ${value.length}`,
-              );
-            }
-            break;
-          case gl.INT_VEC4:
-            if (value.length === 4) {
-              gl.uniform4i(
-                location,
-                Math.floor(value[0]),
-                Math.floor(value[1]),
-                Math.floor(value[2]),
-                Math.floor(value[3]),
-              );
-            } else {
-              throw new Error(
-                `Expected 4 values for INT_VEC4, got ${value.length}`,
-              );
-            }
-            break;
-          default:
-            // Default to float vectors
-            switch (value.length) {
-              case 2:
-                gl.uniform2f(location, value[0], value[1]);
-                break;
-              case 3:
-                gl.uniform3f(location, value[0], value[1], value[2]);
-                break;
-              case 4:
-                gl.uniform4f(location, value[0], value[1], value[2], value[3]);
-                break;
-              default:
-                throw new Error(`Unsupported array length: ${value.length}`);
-            }
-            break;
-        }
-      } else {
-        // Fallback to float vectors if no introspection available
-        switch (value.length) {
-          case 2:
-            gl.uniform2f(location, value[0], value[1]);
-            break;
-          case 3:
-            gl.uniform3f(location, value[0], value[1], value[2]);
-            break;
-          case 4:
-            gl.uniform4f(location, value[0], value[1], value[2], value[3]);
-            break;
-          default:
-            throw new Error(`Unsupported array length: ${value.length}`);
-        }
+      switch (uniformInfo.type) {
+        case gl.BOOL:
+          gl.uniform1i(location, value ? 1 : 0);
+          break;
+        case gl.BOOL_VEC2:
+          gl.uniform2i(location, value ? 1 : 0, value ? 1 : 0);
+          break;
+        case gl.BOOL_VEC3:
+          gl.uniform3i(location, value ? 1 : 0, value ? 1 : 0, value ? 1 : 0);
+          break;
+        case gl.BOOL_VEC4:
+          gl.uniform4i(
+            location,
+            value ? 1 : 0,
+            value ? 1 : 0,
+            value ? 1 : 0,
+            value ? 1 : 0,
+          );
+          break;
+        default:
+          throw new Error(
+            `Unsupported boolean uniform type: ${uniformInfo.type} ${uniformInfo.name}`,
+          );
       }
-    } else if (value && typeof value === "object" && "rgba" in value) {
-      // Handle Colord objects and objects with rgba properties using introspection
-      const rgba = (value as any).rgba;
+    } else if (Array.isArray(value)) {
+      switch (uniformInfo.type) {
+        case gl.INT_VEC2:
+          gl.uniform2i(location, value[0] | 0, value[1] | 0);
+          break;
+        case gl.INT_VEC3:
+          gl.uniform3i(location, value[0] | 0, value[1] | 0, value[2] | 0);
+          break;
+        case gl.INT_VEC4:
+          gl.uniform4i(
+            location,
+            value[0] | 0,
+            value[1] | 0,
+            value[2] | 0,
+            value[3] | 0,
+          );
+          break;
+        case gl.FLOAT_VEC2:
+          gl.uniform2f(location, value[0], value[1]);
+          break;
+        case gl.FLOAT_VEC3:
+          gl.uniform3f(location, value[0], value[1], value[2]);
+          break;
+        case gl.FLOAT_VEC4:
+          gl.uniform4f(location, value[0], value[1], value[2], value[3]);
+          break;
+        case gl.FLOAT_MAT2:
+          gl.uniformMatrix2fv(location, false, value);
+          break;
+        case gl.FLOAT_MAT3:
+          gl.uniformMatrix3fv(location, false, value);
+          break;
+        case gl.FLOAT_MAT4:
+          gl.uniformMatrix4fv(location, false, value);
+          break;
+        default:
+          throw new Error(`Unsupported array length: ${value.length}`);
+      }
+    } else if (value instanceof Colord) {
+      const rgba = (value as Colord).rgba;
+      // Colord specifically uses 0-1 for alpha
+      const intAlpha = rgba.a === undefined ? 255 : rgba.a * 255;
+      const floatAlpha = rgba.a;
 
-      if (uniformInfo) {
-        switch (uniformInfo.type) {
-          case gl.FLOAT_VEC3:
-            // Shader expects vec3 - send RGB only
-            gl.uniform3f(
-              location,
-              rgba.r / 255.0,
-              rgba.g / 255.0,
-              rgba.b / 255.0,
-            );
-            break;
-          case gl.FLOAT_VEC4:
-            // Shader expects vec4 - send RGBA
-            const alpha = rgba.a !== undefined ? rgba.a / 255.0 : 1.0;
-            gl.uniform4f(
-              location,
-              rgba.r / 255.0,
-              rgba.g / 255.0,
-              rgba.b / 255.0,
-              alpha,
-            );
-            break;
-          case gl.INT_VEC3:
-            // Integer RGB
-            gl.uniform3i(location, rgba.r | 0, rgba.g | 0, rgba.b | 0);
-            break;
-          case gl.INT_VEC4:
-            // Integer RGBA
-            const alphaInt = rgba.a !== undefined ? rgba.a : 255;
-            gl.uniform4i(
-              location,
-              rgba.r | 0,
-              rgba.g | 0,
-              rgba.b | 0,
-              alphaInt | 0,
-            );
-            break;
-          default:
-            // Fallback: assume vec3 for RGB if alpha is 1.0, otherwise vec4
-            if (rgba.a === undefined || rgba.a === 1.0 || rgba.a === 255) {
-              gl.uniform3f(
-                location,
-                rgba.r / 255.0,
-                rgba.g / 255.0,
-                rgba.b / 255.0,
-              );
-            } else {
-              gl.uniform4f(
-                location,
-                rgba.r / 255.0,
-                rgba.g / 255.0,
-                rgba.b / 255.0,
-                rgba.a / 255.0,
-              );
-            }
-            break;
-        }
-      } else {
-        // Fallback to old behavior if no introspection available
-        if (rgba.a === undefined || rgba.a === 1.0 || rgba.a === 255) {
+      switch (uniformInfo.type) {
+        case gl.INT_VEC3:
+          gl.uniform3i(location, rgba.r | 0, rgba.g | 0, rgba.b | 0);
+          break;
+        case gl.INT_VEC4:
+          gl.uniform4i(
+            location,
+            rgba.r | 0,
+            rgba.g | 0,
+            rgba.b | 0,
+            intAlpha | 0,
+          );
+          break;
+        case gl.FLOAT_VEC3:
           gl.uniform3f(
             location,
             rgba.r / 255.0,
             rgba.g / 255.0,
             rgba.b / 255.0,
           );
-        } else {
+          break;
+        case gl.FLOAT_VEC4:
           gl.uniform4f(
             location,
             rgba.r / 255.0,
             rgba.g / 255.0,
             rgba.b / 255.0,
-            rgba.a / 255.0,
+            floatAlpha,
           );
-        }
+          break;
+        default:
+          throw new Error(
+            `Unsupported uniform type: ${uniformInfo.type} ${uniformInfo.name}`,
+          );
+      }
+    } else if (value && typeof value === "object" && "rgba" in value) {
+      // Handle Colord objects and objects with rgba properties using introspection
+      const rgba = (value as any).rgba;
+      const intAlpha = (rgba.a === undefined ? 255 : rgba.a * 255) | 0;
+      const floatAlpha = rgba.a;
+
+      switch (uniformInfo.type) {
+        case gl.INT_VEC3:
+          gl.uniform3i(location, rgba.r | 0, rgba.g | 0, rgba.b | 0);
+          break;
+        case gl.INT_VEC4:
+          gl.uniform4i(
+            location,
+            rgba.r | 0,
+            rgba.g | 0,
+            rgba.b | 0,
+            intAlpha | 0,
+          );
+          break;
+        case gl.FLOAT_VEC3:
+          gl.uniform3f(
+            location,
+            rgba.r / 255.0,
+            rgba.g / 255.0,
+            rgba.b / 255.0,
+          );
+          break;
+        case gl.FLOAT_VEC4:
+          gl.uniform4f(
+            location,
+            rgba.r / 255.0,
+            rgba.g / 255.0,
+            rgba.b / 255.0,
+            floatAlpha,
+          );
+          break;
+        default:
+          throw new Error(
+            `Unsupported uniform type: ${uniformInfo.type} ${uniformInfo.name}`,
+          );
       }
     } else if (value && typeof value === "object") {
-      // Debug: log unknown object types
       console.error(
         `Unknown object type for uniform ${name ?? uniformInfo?.name}:`,
         {

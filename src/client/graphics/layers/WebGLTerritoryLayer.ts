@@ -75,6 +75,7 @@ void main() {
 }`;
 
   private static readonly FRAGMENT_SHADER_SOURCE = `#version 300 es
+  #line 78
 precision mediump float;
 precision mediump usampler2D;  // sampled integers are only 16 bits
 precision mediump int;
@@ -96,18 +97,17 @@ uniform int u_focusedPlayerId;
 uniform sampler2D u_paletteTexture;
 uniform float u_territoryAlpha;     // Common alpha for all territory colors
 uniform float u_borderAlpha;        // Common alpha for borders
-uniform vec3 u_focusedBorderColor;
-uniform vec3 u_falloutColor;
+uniform vec4 u_focusedBorderColor;
+uniform vec4 u_falloutColor;
 
 // Currently not used - uncomment in uniform declaration and here if needed
-//uniform vec3 u_spawnHighlightColor;
-//uniform vec3 u_selfColor;
-//uniform vec3 u_allyColor;
-//uniform vec3 u_enemyColor;
+//uniform vec4 u_spawnHighlightColor;
+//uniform vec4 u_selfColor;
+//uniform vec4 u_allyColor;
+//uniform vec4 u_enemyColor;
 
 uniform bool debug_draw_palette;
 uniform bool debug_draw_tiles;
-uniform float debug_draw_cpu_percent;
 
 //
 // common shader helper functions
@@ -213,7 +213,7 @@ vec4 getPlayerColor(uint ownerId, uint row)
   ivec2 pixelCoord = ivec2(ownerId, row);
   vec4 paletteColor = texelFetch(u_paletteTexture, pixelCoord, mipLevel);
   float alpha = (row >= PLAYER_COLOR_BORDER) ? u_borderAlpha : u_territoryAlpha;
-  return vec4(paletteColor.rgb, alpha);
+  return paletteColor * alpha; // Premultiplied alpha
 }
 
 vec4 calculateDefendedBorderColor(uint ownerId, vec2 uv) 
@@ -234,7 +234,7 @@ vec4 calculateBorderColor(TileData tileData, vec2 uv)
 {
   if (u_hasFocusedPlayer > 0.0f && tileData.ownerId == uint(u_focusedPlayerId)) 
   {
-    return vec4(u_focusedBorderColor, u_territoryAlpha);
+    return u_focusedBorderColor * u_borderAlpha;
   } 
   else if (tileData.hasDefenseBonus)
   {
@@ -258,7 +258,7 @@ vec4 territoryColor()
     
     if (thisTile.isFallout)
     {
-      result = vec4(u_falloutColor.rgb, u_territoryAlpha);
+      result = u_falloutColor * u_territoryAlpha;
     }
     else if (thisTile.ownerId == UNOWNED_TERRITORY_ID)
     {
@@ -283,7 +283,7 @@ vec4 territoryColor()
 //
 // Debug visualizations of input data
 //
-vec4 DebugDrawPalette(vec4 inColor, vec2 offset)
+vec4 DebugDrawPalette(vec4 inColor)
 {
   int mipLevel = 0;
   int debugTileSize = 1;
@@ -316,7 +316,7 @@ void main()
   // Composite debug layers on top
   if (debug_draw_palette)
   {
-    fragColor = DebugDrawPalette(fragColor, vec2(0.0, 0.0));
+    fragColor = DebugDrawPalette(fragColor);
   }
 }
 `;
@@ -457,7 +457,6 @@ void main()
       this.uploadAllDataToGPU();
       this.renderToCanvas();
       this.lastRefresh = now;
-      console.log("🎨 renderLayer - Stage and upload");
     }
 
     context.drawImage(
@@ -480,41 +479,36 @@ void main()
   }
 
   private initWebGL(): boolean {
-    this.canvas.width = this.game.width();
-    this.canvas.height = this.game.height();
+    // prettier-ignore
+    const game = this.game;
+    const [width, height] = [game.width(), game.height()];
+    [this.canvas.width, this.canvas.height] = [width, height];
 
-    const gl = (this.gl = this.canvas.getContext(
-      "webgl2",
-    ) as WebGL2RenderingContext);
+    const gl = (this.gl = this.canvas.getContext("webgl2", {
+      alpha: true,
+      depth: false,
+      stencil: false,
+      premultipliedAlpha: true,
+    }) as WebGL2RenderingContext);
     if (!this.gl) {
       console.error("Failed to get WebGL context");
       return false;
     }
-    const game = this.game;
-    const [width, height] = [game.width(), game.height()];
 
-    const program = (this.program = WebGLTerritoryLayer.createProgram(gl));
-    const vertexBuffer = (this.vertexBuffer =
-      WebGLTerritoryLayer.createVertexBuffer(gl));
-    this.uniformSetter = WebGLTerritoryLayer.bindProgram(
-      gl,
-      this.program,
-      vertexBuffer,
-    );
-    this.tileTextureData = WebGLTerritoryLayer.createTileTexture(
-      gl,
-      width,
-      height,
-    );
-    this.colorPalette = WebGLTerritoryLayer.createColorPalette(gl, game);
+    const Static = WebGLTerritoryLayer;
+    this.program = Static.createProgram(gl);
+    this.vertexBuffer = Static.createVertexBuffer(gl);
+    this.tileTextureData = Static.createTileTexture(gl, width, height);
+    this.colorPalette = Static.createColorPalette(gl, game);
+    this.uniformSetter = new UniformSetter(gl, this.program);
+    Static.bindProgram(gl, this.program, this.vertexBuffer);
 
     // Initialize constant shader uniform parameters
     this.uniforms.sampler["u_paletteTexture"] = 0;
     this.uniforms.sampler["u_tileTexture"] = 1;
 
-    this.uniforms.debug["debug_draw_palette"] = true;
+    this.uniforms.debug["debug_draw_palette"] = true; // Turn off to see territories
     this.uniforms.debug["debug_draw_tiles"] = false;
-    this.uniforms.debug["debug_draw_cpu_percent"] = 0.75;
 
     return true;
   }
@@ -554,25 +548,14 @@ void main()
   }
 
   private static createVertexBuffer(gl: WebGL2RenderingContext): WebGLBuffer {
+    // prettier-ignore
     // Format: [x, y, u, v] for each vertex
     const vertexData = new Float32Array([
       // Position    // Texture coords
-      -1.0,
-      -1.0,
-      0.0,
-      1.0, // Bottom left
-      +1.0,
-      -1.0,
-      1.0,
-      1.0, // Bottom right
-      -1.0,
-      +1.0,
-      0.0,
-      0.0, // Top left
-      +1.0,
-      +1.0,
-      1.0,
-      0.0, // Top right
+      -1.0, -1.0,    0.0, 1.0, // Bottom left
+      +1.0, -1.0,    1.0, 1.0, // Bottom right
+      -1.0, +1.0,    0.0, 0.0, // Top left
+      +1.0, +1.0,    1.0, 0.0, // Top right
     ]);
 
     const vertexBuffer = gl.createBuffer();
@@ -585,7 +568,7 @@ void main()
     gl: WebGL2RenderingContext,
     program: WebGLProgram,
     vertexBuffer: WebGLBuffer,
-  ): UniformSetter {
+  ): void {
     const positionAttributeLocation = gl.getAttribLocation(
       program,
       "a_position",
@@ -614,7 +597,6 @@ void main()
       4 * 4, // stride: 4 floats * 4 bytes per float
       2 * 4, // offset: skip 2 floats (x, y) to get to texture coords
     );
-    return new UniformSetter(gl, program);
   }
 
   private static createTileTexture(
@@ -656,12 +638,11 @@ void main()
     this.gl.clear(this.gl.COLOR_BUFFER_BIT);
     this.gl.useProgram(this.program);
 
-    this.colorPalette.textureData!.bindToTextureUnit(
-      this.uniforms.sampler["u_paletteTexture"],
-    );
-    this.tileTextureData!.bindToTextureUnit(
-      this.uniforms.sampler["u_tileTexture"],
-    );
+    const samplers = this.uniforms.sampler;
+    const tex2d_palette = this.colorPalette.textureData!;
+    const tex2d_tile = this.tileTextureData!;
+    tex2d_palette.bindToTextureUnit(samplers["u_paletteTexture"]);
+    tex2d_tile.bindToTextureUnit(samplers["u_tileTexture"]);
 
     // Upload all uniform parameters
     this.uniformSetter.set(this.colorPalette!.uniforms);
@@ -672,8 +653,6 @@ void main()
     // Draw the textured quad
     this.gl.drawArrays(this.gl.TRIANGLE_STRIP, 0, 4);
   }
-
-  private renderGpuOnly = false;
 
   dispose() {
     if (!this.gl) {

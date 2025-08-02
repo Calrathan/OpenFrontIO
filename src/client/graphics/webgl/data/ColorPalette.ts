@@ -54,12 +54,10 @@ export class ColorPalette implements GpuData {
     if (this.game === null) return;
     if (this.textureData === null) return;
     if (!this.needsCpuUpdate()) return;
+
     const theme = (this.previousTheme = this.currentTheme());
     const playerCount = (this.previousPlayerCount = this.currentPlayerCount());
 
-    console.log(
-      `Updating palette image with player count: ${this.previousPlayerCount}`,
-    );
     const width = this.textureData.width; // maximum owner bits for terrain ownership
     const height = this.textureData.height; // variations of color for player
     const bytes = this.textureData.bytes;
@@ -83,6 +81,7 @@ export class ColorPalette implements GpuData {
 
     // Cache all palette colors parameterized by player
     for (let smallId = 1; smallId <= paletteMaxColor; smallId++) {
+      // prettier-ignore
       const x = smallId;
       const player = this.game.playerBySmallID(smallId) as PlayerView;
 
@@ -96,22 +95,22 @@ export class ColorPalette implements GpuData {
       bytes[row_player_color + x * bpp + 0] = territoryColor.rgba.r;
       bytes[row_player_color + x * bpp + 1] = territoryColor.rgba.g;
       bytes[row_player_color + x * bpp + 2] = territoryColor.rgba.b;
-      bytes[row_player_color + x * bpp + 3] = territoryColor.rgba.a;
+      bytes[row_player_color + x * bpp + 3] = 255;
 
       bytes[row_building_color + x * bpp + 0] = specialBuildingColor.rgba.r;
       bytes[row_building_color + x * bpp + 1] = specialBuildingColor.rgba.g;
       bytes[row_building_color + x * bpp + 2] = specialBuildingColor.rgba.b;
-      bytes[row_building_color + x * bpp + 3] = specialBuildingColor.rgba.a;
+      bytes[row_building_color + x * bpp + 3] = 255;
 
       bytes[row_railroad + x * bpp + 0] = railroadColor.rgba.r;
       bytes[row_railroad + x * bpp + 1] = railroadColor.rgba.g;
       bytes[row_railroad + x * bpp + 2] = railroadColor.rgba.b;
-      bytes[row_railroad + x * bpp + 3] = railroadColor.rgba.a;
+      bytes[row_railroad + x * bpp + 3] = 255;
 
       bytes[row_border_undefended + x * bpp + 0] = borderColor.rgba.r;
       bytes[row_border_undefended + x * bpp + 1] = borderColor.rgba.g;
       bytes[row_border_undefended + x * bpp + 2] = borderColor.rgba.b;
-      bytes[row_border_undefended + x * bpp + 3] = borderColor.rgba.a;
+      bytes[row_border_undefended + x * bpp + 3] = 255;
 
       bytes[row_border_defended_light + x * bpp + 0] =
         defendedBorderColors.light.rgba.r;
@@ -119,8 +118,7 @@ export class ColorPalette implements GpuData {
         defendedBorderColors.light.rgba.g;
       bytes[row_border_defended_light + x * bpp + 2] =
         defendedBorderColors.light.rgba.b;
-      bytes[row_border_defended_light + x * bpp + 3] =
-        defendedBorderColors.light.rgba.a;
+      bytes[row_border_defended_light + x * bpp + 3] = 255;
 
       bytes[row_border_defended_dark + x * bpp + 0] =
         defendedBorderColors.dark.rgba.r;
@@ -128,15 +126,15 @@ export class ColorPalette implements GpuData {
         defendedBorderColors.dark.rgba.g;
       bytes[row_border_defended_dark + x * bpp + 2] =
         defendedBorderColors.dark.rgba.b;
-      bytes[row_border_defended_dark + x * bpp + 3] =
-        defendedBorderColors.dark.rgba.a;
+      bytes[row_border_defended_dark + x * bpp + 3] = 255;
     }
 
     this.uniforms["u_borderAlpha"] = 255.0 / 255.0;
     this.uniforms["u_territoryAlpha"] = 150.0 / 255.0;
     this.uniforms["u_focusedBorderColor"] = theme.focusedBorderColor();
     this.uniforms["u_falloutColor"] = theme.falloutColor();
-
+    console.log("🎨 focusedBorderColor", this.uniforms["u_focusedBorderColor"]);
+    console.log("🎨 falloutColor", this.uniforms["u_falloutColor"]);
     // Currently not used - uncomment in shader and here if needed
     //this.uniforms["u_spawnHighlightColor"] = theme.spawnHighlightColor();
     //this.uniforms["u_selfColor"] = theme.selfColor();
@@ -148,8 +146,8 @@ export class ColorPalette implements GpuData {
 
   uploadToGpu(gl: WebGL2RenderingContext): void {
     if (!this.needsGpuUpload) return;
-
     this.textureData?.uploadChangesToGpu();
+    this.needsGpuUpload = false;
   }
   dispose() {
     this.textureData?.dispose();
